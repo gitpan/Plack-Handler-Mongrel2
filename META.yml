@@ -26,8 +26,8 @@ requires:
   Parallel::Prefork: 0
   Plack: 0
   URI::Escape: 0
-  ZeroMQ: 0.02
+  ZeroMQ: 0.08
 resources:
   license: http://opensource.org/licenses/artistic-license-2.0.php
   repository: git://github.com/lestrrat/Plack-Handler-Mongrel2.git
-version: 0.01000_02
+version: 0.01000_03
