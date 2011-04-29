@@ -1,15 +1,15 @@
 package Plack::Handler::Mongrel2;
 use strict;
 use base qw(Plack::Handler);
-our $VERSION = '0.01000_03';
+our $VERSION = '0.01000_04';
 use ZeroMQ::Raw;
 use ZeroMQ::Constants qw(
     ZMQ_POLLIN
-    ZMQ_UPSTREAM
     ZMQ_PULL
     ZMQ_PUB
     ZMQ_IDENTITY
     ZMQ_RCVMORE
+    ZMQ_LINGER
 );
 use JSON qw(decode_json);
 use HTTP::Status qw(status_message);
@@ -42,6 +42,25 @@ sub _parse_headers {
     return decode_json $headers;
 }
 
+sub _parse_pattern {
+    my $pattern = shift;
+    if (DEBUG()) {
+        print STDERR "[Mongrel2.pm] Decoding PATTERN '$pattern'\n";
+    }
+    my ($name) = split /\(/, $pattern, 2;
+    $name =~ s{/+$}{};
+    $name;
+}
+
+sub _parse_path {
+    my ($path, $script_name) = @_;
+    if (DEBUG()) {
+        print STDERR "[Mongrel2.pm] Decoding PATH '$path ($script_name)'\n";
+    }
+    $path =~ s/^$script_name//;
+    URI::Escape::uri_unescape($path);
+}
+
 
 sub mongrel2_req_to_psgi {
     my ($self, $data) = @_;
@@ -63,24 +82,23 @@ sub mongrel2_req_to_psgi {
         'psgi.nonblocking'  => 0,
     );
 
-    ($env{MONGREL2_SENDER_ID}, $env{MONGREL2_CONN_ID}, $env{PATH_INFO}, $rest) =
+    ($env{MONGREL2_SENDER_ID}, $env{MONGREL2_CONN_ID}, undef, $rest) =
         split / /, $data, 4;
-
-    $env{PATH_INFO} = URI::Escape::uri_unescape($env{PATH_INFO});
 
     ($headers, $rest) = _parse_netstring($rest);
 
     my $hdrs = _parse_headers($headers);
 
+    my $script_name = _parse_pattern(delete $hdrs->{PATTERN});
+
     $env{QUERY_STRING}    = delete $hdrs->{QUERY} || '';
     $env{REQUEST_METHOD}  = delete $hdrs->{METHOD};
     $env{REQUEST_URI}     = delete $hdrs->{URI};
-    $env{SCRIPT_NAME}     = delete $hdrs->{PATH} || '';
-    if ($env{SCRIPT_NAME} eq '/') {
-        $env{SCRIPT_NAME} = '';
-    }
+    $env{SCRIPT_NAME}     = $script_name;
+    $env{PATH_INFO}       = _parse_path(delete $hdrs->{PATH}, $script_name);
     $env{SERVER_PROTOCOL} = delete $hdrs->{VERSION};
     ($env{SERVER_NAME}, $env{SERVER_PORT}) = split /:/, delete $hdrs->{host}, 2;
+    $env{SERVER_PORT} ||= 80;
 
     foreach my $key (keys %$hdrs) {
         my $new_key = uc $key;
@@ -144,7 +162,7 @@ sub run {
 
     my $max_workers = $self->max_workers;
     if ($max_workers > 1) {
-        require Paralell::Prefork;
+        require Parallel::Prefork;
         my $pm = Parallel::Prefork->new({
             max_workers => $max_workers,
             trap_signals => {
@@ -185,7 +203,7 @@ sub run {
 sub prepare_zmq {
     my ($self) = @_;
     my $ctxt     = zmq_init();
-    my $incoming = zmq_socket( $ctxt, ZMQ_UPSTREAM );
+    my $incoming = zmq_socket( $ctxt, ZMQ_PULL );
     my $outgoing = zmq_socket( $ctxt, ZMQ_PUB );
 
     zmq_connect( $incoming, $self->send_spec );
@@ -193,15 +211,22 @@ sub prepare_zmq {
         print STDERR "[Mongrel2.pm] Connected incoming socket to ",
             $self->send_spec, "\n";
     }
-    zmq_connect( $outgoing, $self->recv_spec );
-    if (DEBUG()) {
-        print STDERR "[Mongrel2.pm] Connected outcoming socket to ",
-            $self->recv_spec, "\n";
-    }
-    zmq_setsockopt( $outgoing, ZMQ_IDENTITY, $self->send_spec );
+    zmq_setsockopt( $incoming, ZMQ_IDENTITY, $self->send_ident );
     if (DEBUG()) {
         print STDERR "[Mongrel2.pm] outgoing socket sets identity to ",
             $self->send_ident, "\n";
+    }
+
+    zmq_connect( $outgoing, $self->recv_spec );
+    if (DEBUG()) {
+        print STDERR "[Mongrel2.pm] Connected outgoing socket to ",
+            $self->recv_spec, "\n";
+    }
+    zmq_setsockopt( $outgoing, ZMQ_LINGER, 1 );
+    zmq_setsockopt( $outgoing, ZMQ_IDENTITY, $self->recv_ident );
+    if (DEBUG()) {
+        print STDERR "[Mongrel2.pm] outgoing socket sets identity to ",
+            $self->recv_ident, "\n";
     }
 
     return ($ctxt, $incoming, $outgoing);
@@ -239,6 +264,10 @@ sub accept_loop {
                 callback => sub {
                     while ( my $msg = zmq_recv( $incoming, ZMQ_RCVMORE ) ) {
                         my $env = $self->mongrel2_req_to_psgi( zmq_msg_data( $msg ) );
+                        if ( DEBUG() ) {
+                            require Data::Dumper;
+                            print STDERR Data::Dumper::Dumper($env);
+                        }
                         next unless $env;
 
                         eval {
@@ -278,7 +307,7 @@ sub reply {
         push @$hdrs, "Content-Length", length $body;
     }
 
-    my $mongrel_resp = sprintf( "%s %d:%s, %s %d %s\r\n%s\r\n\r\n%s",
+    my $mongrel_header = sprintf( "%s %d:%s, %s %d %s\r\n%s\r\n\r\n",
         $env->{MONGREL2_SENDER_ID},
         length $env->{MONGREL2_CONN_ID},
         $env->{MONGREL2_CONN_ID},
@@ -286,17 +315,26 @@ sub reply {
         $status,
         status_message($status),
         join("\r\n", map { sprintf( '%s: %s', $hdrs->[$_ * 2], $hdrs->[$_ * 2 + 1] ) } (0.. (@$hdrs/2 - 1) ) ),
-        $body,
     );
 
     if (DEBUG) {
         print STDERR "[Mongrel2.pm]: Sending\n";
         print STDERR 
-            join "\\r\\n\n", map { "    $_" } (split /\r\n/, $mongrel_resp);
-        print STDERR "\n";
+            join "\\r\\n\n", map { "    $_" } (split /\r\n/, $mongrel_header);
+        print STDERR "$body\n";
     }
 
-    zmq_send( $outgoing, $mongrel_resp );
+    my %hdr = @$hdrs;
+    if ($hdr{'Content-Type'} =~ /^text.*utf-8/i) {
+        # Allow conversion to UTF-8
+        zmq_send( $outgoing, $mongrel_header . $body);
+    }
+    else {
+        # Ensure body is not converted to UTF-8
+        use bytes;
+        zmq_send( $outgoing, $mongrel_header . $body);
+    }
+
 }
 
 1;

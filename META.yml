@@ -30,4 +30,4 @@ requires:
 resources:
   license: http://opensource.org/licenses/artistic-license-2.0.php
   repository: git://github.com/lestrrat/Plack-Handler-Mongrel2.git
-version: 0.01000_03
+version: 0.01000_04
